@@ -28,12 +28,13 @@
 //   const ok = await StellarCred.hasClaim(walletAddress, "kyc");
 
 export * from "./claims";
+export * from "./capabilities";
 export * from "./challenge";
 export * from "./uniqueness";
 export { createClaimGate } from "./core";
 export type { ClaimGateConfig, ClaimGateState, ClaimGateListener, ClaimGate } from "./core";
 export { useStellarCred } from "./react";
-export type { UseStellarCredOptions, UseStellarCredResult } from "./react";
+export type { UseStellarCredResult } from "./react";
 
 import {
   configure,
@@ -52,13 +53,33 @@ import {
   parseReturnParams,
   watchClaim,
   withRetry,
+  normalizeRpcError,
+  classifyTransientFailure,
   CLAIM_TYPES,
+  deriveNullifier,
+  isNullifierUsed,
+  verifyUniquePersonhood,
   TimeoutError,
   ConfigError,
   InvalidAddressError,
+} from "./claims";
+
+import {
   RpcError,
   IndexerError,
-} from "./claims";
+  ContractError,
+  ContractErrorCode,
+  parseContractError,
+  TransactionSubmissionError,
+} from "./errors";
+
+import { submitTransaction } from "./submit";
+
+import {
+  bootstrap,
+  fetchCapabilities,
+  validateCapabilitiesDescriptor,
+} from "./capabilities";
 
 import {
   createWalletChallenge,
@@ -75,6 +96,9 @@ import { subscribeClaims } from "./subscriptions";
 
 export const StellarCred = {
   configure,
+  bootstrap,
+  fetchCapabilities,
+  validateCapabilitiesDescriptor,
   healthCheck,
   isConfigured,
   hasClaim,
@@ -90,6 +114,9 @@ export const StellarCred = {
   parseReturnParams,
   watchClaim,
   withRetry,
+  normalizeRpcError,
+  classifyTransientFailure,
+  submitTransaction,
   subscribeClaims,
   createWalletChallenge,
   verifyWalletSignature,
@@ -98,10 +125,17 @@ export const StellarCred = {
   createUniquenessAttestation,
   sameUniquenessSubject,
   CLAIM_TYPES,
+  deriveNullifier,
+  isNullifierUsed,
+  verifyUniquePersonhood,
   TimeoutError,
   ConfigError,
   InvalidAddressError,
   RpcError,
   IndexerError,
+  ContractError,
+  ContractErrorCode,
+  TransactionSubmissionError,
+  parseContractError,
 };
 export default StellarCred;

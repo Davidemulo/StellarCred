@@ -9,7 +9,7 @@
 // from here, so nothing in this module imports back from those files â€” keeping
 // the module graph acyclic.
 
-import { Client as ProofRegistryClient } from "../../proof-registry/src/index";
+import type { Client as ProofRegistryClient } from "../../proof-registry/src/index";
 import {
   IndexerError,
   evaluateClaimRow,
@@ -17,6 +17,8 @@ import {
   findClaimRow,
   type IndexerClaimRow,
 } from "./indexer";
+// RpcError has been moved to ./errors.ts (issue #404)
+import { RpcError, ContractError, ContractErrorCode, parseContractError } from "./errors";
 
 export { IndexerError };
 export type { IndexerClaimRow };
@@ -419,25 +421,6 @@ export class InvalidThresholdError extends Error {
   }
 }
 
-/**
- * Error thrown when an RPC / contract-simulation call fails.
- */
-export class RpcError extends Error {
-  cause?: unknown;
-  constructor(
-    message = "StellarCred RPC call failed",
-    options?: { cause?: unknown } | unknown,
-  ) {
-    super(message);
-    this.name = "RpcError";
-    if (options && typeof options === "object" && "cause" in (options as any)) {
-      this.cause = (options as any).cause;
-    } else if (options !== undefined) {
-      this.cause = options;
-    }
-  }
-}
-
 /** The credential types StellarCred supports. Matches the contract Symbols. */
 export const CLAIM_TYPES = [
   "kyc",
@@ -512,6 +495,7 @@ export interface ProofRecordDetails {
   issuer?: string;
   threshold?: number;
   vkVersion: number;
+  reason?: string;
 }
 
 export interface CredentialStatusResult {
@@ -712,9 +696,9 @@ async function getClient(throwOnError = false): Promise<ProofRegistryClient | nu
   if (_client && _clientKey === key) return _client;
 
   _clientKey = key;
-  _client = getSdk().then(
-    () =>
-      new ProofRegistryClient({
+  _client = Promise.all([getSdk(), import("../../proof-registry/src/index")]).then(
+    ([, { Client }]) =>
+      new Client({
         networkPassphrase,
         contractId: registryId,
         rpcUrl,
@@ -762,6 +746,17 @@ function isRetryable(error: any): boolean {
       return false;
     }
   }
+  // Transient RPC/transport failures: HTTP 429/5xx, network timeouts, and
+  // unknown error shapes that are not obviously terminal.
+  if (error instanceof RpcError) {
+    const status = error.status;
+    if (status === undefined) return true;
+    if (status === 429 || (status >= 500 && status < 600)) return true;
+    return false;
+  }
+  if (error instanceof ContractError) {
+    return error.isRetryable();
+  }
   return true;
 }
 
@@ -770,6 +765,50 @@ class ReadTimeoutError extends Error {
     super(`RPC read timed out after ${timeoutMs}ms`);
     this.name = "ReadTimeoutError";
   }
+}
+
+/**
+ * Classification of a failure reason for submission paths that want to
+ * display or branch on *why* a transient failure happened (rate-limited vs.
+ * server error vs. network timeout) without parsing status codes themselves.
+ */
+export type TransientFailureKind =
+  | { kind: "rate_limited"; statusCode: number; retryAfterMs?: number }
+  | { kind: "server_error"; statusCode: number }
+  | { kind: "network_error"; message: string };
+
+/**
+ * Inspect a thrown error from a submission or RPC path and return a structured
+ * transient-failure descriptor when the error is retryable. Returns null for
+ * non-retryable errors (configuration, validation, terminal contract panics).
+ */
+export function classifyTransientFailure(error: unknown): TransientFailureKind | null {
+  if (!isRetryable(error)) return null;
+
+  if (error instanceof RpcError) {
+    const status = error.status;
+    if (status === 429) {
+      return { kind: "rate_limited", statusCode: 429 };
+    }
+    if (status !== undefined && status >= 500 && status < 600) {
+      return { kind: "server_error", statusCode: status };
+    }
+    // An unknown/unset RpcError still counts as transient.
+    return { kind: "network_error", message: error.message };
+  }
+
+  if (error instanceof ContractError) {
+    if (error.code === ContractErrorCode.SubmissionsPaused) {
+      return { kind: "server_error", statusCode: 503 };
+    }
+    return null;
+  }
+
+  if (error instanceof Error) {
+    return { kind: "network_error", message: error.message };
+  }
+
+  return { kind: "network_error", message: String(error) };
 }
 
 function withRequestTimeout<T>(operation: () => Promise<T>, timeoutMs: number): Promise<T> {
@@ -781,6 +820,58 @@ function withRequestTimeout<T>(operation: () => Promise<T>, timeoutMs: number): 
   return Promise.race([Promise.resolve().then(operation), timeout]).finally(() =>
     clearTimeout(timeoutId),
   );
+}
+
+export interface NormalizedRpcErrorOptions {
+  /** Human-readable summary of what failed. */
+  message: string;
+  /** Original thrown value, if any. */
+  cause?: unknown;
+  /** HTTP status when the RPC responded with an error status. */
+  status?: number;
+  /** Parsed contract error when the failure was a contract panic. */
+  contractError?: ContractError;
+}
+
+/**
+ * Normalize an arbitrary thrown value from an RPC/submission path into an
+ * actionable {@link RpcError} with a stable `name`, optional `status`, and an
+ * optional parsed `contractError` with a numeric `code` and
+ * `friendlyMessage`.
+ *
+ * Callers that want a code/message union should still inspect `contractError`
+ * (for contract panics) or `status` (for transport errors).
+ */
+export function normalizeRpcError(
+  raw: unknown,
+  opts: NormalizedRpcErrorOptions,
+): RpcError {
+  let contractError: ContractError | undefined;
+  let status: number | undefined;
+
+  if (raw instanceof RpcError) {
+    contractError = raw.contractError;
+    status = raw.status;
+  } else if (raw instanceof ContractError) {
+    contractError = raw;
+  } else if (typeof raw === "string") {
+    contractError = parseContractError(raw) ?? undefined;
+  } else if (raw && typeof raw === "object") {
+    const candidate = raw as Record<string, unknown>;
+    if (typeof candidate.message === "string") {
+      contractError = parseContractError(candidate.message) ?? undefined;
+    }
+    if (typeof candidate.status === "number") status = candidate.status;
+  }
+
+  if (opts.status !== undefined) status = opts.status;
+  if (contractError && !opts.contractError) opts.contractError = contractError;
+
+  return new RpcError(opts.message, {
+    cause: opts.cause ?? raw,
+    status,
+    contractError: opts.contractError,
+  });
 }
 
 export async function withRetry<T>(
@@ -1198,6 +1289,13 @@ async function readRecord(
       requestTimeoutMs,
     );
     if (!result) return null;
+    const reasonMap: Record<number, string> = {
+      0: "expired",
+      1: "superseded",
+      2: "fraud",
+      3: "user_request",
+      4: "other",
+    };
     return {
       verifiedAt: Number(result.verified_at),
       expiry: Number(result.expiry),
@@ -1208,6 +1306,7 @@ async function readRecord(
           ? Number(result.threshold)
           : undefined,
       vkVersion: Number(result.vk_version),
+      reason: result.reason !== undefined ? reasonMap[Number(result.reason)] || "other" : undefined,
     };
   } catch (err) {
     if (throwOnError) {
@@ -1927,4 +2026,104 @@ export function watchClaim(
       poll();
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Nullifier / Unique Personhood (#395)
+// ---------------------------------------------------------------------------
+
+/**
+ * Derives a deterministic per-app nullifier for cross-app unlinkable Sybil resistance (#395).
+ * Generates a 32-byte hex string representing the hash of secret and appContext.
+ */
+export function deriveNullifier(secret: string | bigint, appContext: string | bigint): string {
+  const payload = `${secret.toString()}::${appContext.toString()}`;
+  let h1 = 0xdeadbeef ^ 42;
+  let h2 = 0x41c6ce57 ^ 42;
+  for (let i = 0; i < payload.length; i++) {
+    const ch = payload.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  const part1 = (h1 >>> 0).toString(16).padStart(8, "0");
+  const part2 = (h2 >>> 0).toString(16).padStart(8, "0");
+  const part3 = (Math.imul(h1, 31) >>> 0).toString(16).padStart(8, "0");
+  const part4 = (Math.imul(h2, 37) >>> 0).toString(16).padStart(8, "0");
+  return `${part1}${part2}${part3}${part4}`.padEnd(64, "0");
+}
+
+/**
+ * Checks on-chain whether a nullifier has already been recorded in a given application context.
+ */
+export async function isNullifierUsed(
+  appContext: string,
+  nullifier: string,
+  opts?: { requestTimeoutMs?: number; throwOnError?: boolean },
+): Promise<boolean> {
+< feat/issue-789-export-ui-flow
+  const client = await getClient(opts?.throwOnError);
+  if (!client) {
+    if (opts?.throwOnError) {
+      throw new ConfigError("ProofRegistry client is not configured");
+    }
+    return false;
+  }
+  try {
+    const isUsed = await (client as any).is_nullifier_used({
+      app_context: appContext,
+      nullifier,
+    });
+    return isUsed;
+
+  const client = (await getClient(opts?.throwOnError)) as any;
+  if (!client) {
+    return false;
+  }
+  if (typeof client.is_nullifier_used !== "function") {
+    return false;
+  }
+  try {
+    const res: any = await withRequestTimeout(
+      () =>
+        client.is_nullifier_used({
+          app_context: appContext,
+          nullifier,
+        }),
+      opts?.requestTimeoutMs ?? _config.requestTimeoutMs,
+    );
+    return typeof res?.result === "boolean" ? res.result : Boolean(res);
+ main
+  } catch (err) {
+    if (opts?.throwOnError) {
+      throw new RpcError(`Failed to check nullifier for context "${appContext}"`, { cause: err });
+    }
+    return false;
+  }
+}
+
+/**
+ * High-level unique personhood gating (#395).
+ * Validates that the holder has a valid credential claim AND has not already consumed
+ * their one-per-person grant in this application context.
+ */
+export async function verifyUniquePersonhood(params: {
+  wallet: string;
+  claim: ClaimType;
+  appContext: string;
+  nullifier: string;
+  opts?: ClaimOptions;
+}): Promise<{ verified: boolean; unique: boolean }> {
+  const verified = await hasClaim(params.wallet, params.claim, params.opts);
+  if (!verified) {
+    return { verified: false, unique: false };
+  }
+
+  const alreadyUsed = await isNullifierUsed(params.appContext, params.nullifier, {
+    requestTimeoutMs: params.opts?.requestTimeoutMs,
+    throwOnError: params.opts?.throwOnError,
+  });
+
+  return { verified: true, unique: !alreadyUsed };
 }
