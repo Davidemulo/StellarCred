@@ -94,6 +94,13 @@ import {
 
 import { subscribeClaims } from "./subscriptions";
 
+import {
+  validateCredential,
+  parseCredentialJson,
+  assertValidCredential,
+  CredentialValidationError,
+} from "./validateCredential";
+
 export const StellarCred = {
   configure,
   bootstrap,
@@ -117,6 +124,9 @@ export const StellarCred = {
   normalizeRpcError,
   classifyTransientFailure,
   submitTransaction,
+  validateCredential,
+  parseCredentialJson,
+  assertValidCredential,
   subscribeClaims,
   createWalletChallenge,
   verifyWalletSignature,
@@ -136,6 +146,7 @@ export const StellarCred = {
   ContractError,
   ContractErrorCode,
   TransactionSubmissionError,
+  CredentialValidationError,
   parseContractError,
 };
 export default StellarCred;
